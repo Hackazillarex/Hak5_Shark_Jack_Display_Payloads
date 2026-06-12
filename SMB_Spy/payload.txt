@@ -1,0 +1,214 @@
+#!/bin/bash
+# Title: SMB Spy Ported for the Shark Jack Display
+# Author: Hackazillarex
+# Description: Discovers SMB hosts using nmap and logs results with next-step suggestions
+# Version: 2.0 (Shark Jack Display)
+
+setup_payload() {
+  LOOT_BASE="/root/loot/smb_discovery"
+  OUTFILE=""
+  RAWFILE=""
+  SMB_IPS=()
+  IPADDR=""
+  CIDR=""
+  SCAN_START=0
+  SCAN_END=0
+  LED SETUP
+  mkdir -p "$LOOT_BASE"
+}
+
+log_both() {
+  LOG "$1"
+  echo "$1" >> "$OUTFILE"
+}
+
+initialize_menu() {
+  ADD_MENU_ITEM "Start SMB Spy" "execute_scan"
+  ADD_MENU_ITEM "View Loot Files" "view_loot_files"
+  ADD_MENU_ITEM "Quit" "EXIT_MENU"
+}
+
+set_netmode_dhcp() {
+  NETMODE DHCP_CLIENT
+  WAIT_FOR_IP
+  IPADDR=$(ip -o -4 addr show eth0 | awk '{print $4}' | cut -d/ -f1)
+  LOG "Got IP: $IPADDR"
+}
+
+log_network_info() {
+  # Log gateway, DNS, and our own IP 
+  GW=$(ip route | awk '/default/ {print $3}')
+  DNS=$(cat /etc/resolv.conf | awk '/nameserver/ {print $2}' | head -1)
+  log_both "My IP:   $IPADDR"
+  log_both "Gateway: $GW"
+  log_both "DNS:     $DNS"
+  log_both "Network: $CIDR"
+  log_both "--------------------------------"
+}
+
+ping_sweep() {
+  ALERT "Running ping\nsweep first..." 1 false
+  CREATE_SPINNER "Ping Sweep..."
+  LIVE_HOSTS=$(nmap -sn "$CIDR" | grep "Nmap scan report" | wc -l)
+  STOP_SPINNER
+  LOG "Live hosts: $LIVE_HOSTS"
+  ALERT "$LIVE_HOSTS live host(s)\nfound on subnet" 2 false
+  log_both "Live hosts on subnet: $LIVE_HOSTS"
+}
+
+execute_scan() {
+  LED ATTACK
+  SMB_IPS=()
+
+  TS=$(date +%F_%H-%M-%S)
+  OUTFILE="$LOOT_BASE/smb_hosts_$TS.txt"
+  RAWFILE="$LOOT_BASE/nmap_raw_$TS.txt"
+  touch "$OUTFILE" "$RAWFILE" || {
+    ALERT "ERROR: Cannot\nwrite loot files" 3 false
+    return
+  }
+
+  # Wait for link and get network info
+  ALERT "Waiting for\nlink..." 1 false
+  WAIT_FOR_LINK
+  set_netmode_dhcp
+
+  # Determine CIDR
+  CIDR=$(ip -4 route show dev eth0 | awk '/scope link/ {print $1}')
+  if [ -z "$CIDR" ]; then
+    ALERT "Failed to get\nnetwork CIDR" 3 false
+    LED FINISH
+    return
+  fi
+
+  # Log network context 
+  log_both "=== SMB Spy v2.0 ==="
+  log_both "Timestamp: $TS"
+  log_network_info
+
+  # Ping sweep for live host count 
+  ping_sweep
+
+  # Start scan timer 
+  SCAN_START=$(date +%s)
+  log_both "Starting SMB discovery scan..."
+  ALERT "Scanning:\n$CIDR" 2 false
+
+  # Run nmap with progress bar
+  CREATE_PROGRESS_BAR "SMB Spy"
+  nmap -p 445 -n "$CIDR" --stats-every 1s > "$RAWFILE" 2>&1 &
+  pidof_nmap=$!
+
+  while true; do
+    sleep 0.5
+    COMPLETE="$(cat "$RAWFILE" | grep "remaining" | awk '{print $6}' | tail -n1 | cut -d'.' -f1)"
+    if [ -z "$(ps | grep $pidof_nmap | grep -v grep)" ]; then
+      SET_PROGRESS 100
+      break
+    fi
+    SET_PROGRESS $COMPLETE
+  done
+
+  # Stop scan timer 
+  SCAN_END=$(date +%s)
+  ELAPSED=$((SCAN_END - SCAN_START))
+  log_both "Scan duration: ${ELAPSED}s"
+
+  # Parse nmap results
+  CURRENT_IP=""
+  FOUND=0
+
+  while read -r line; do
+    if echo "$line" | grep -q "Nmap scan report for"; then
+      CURRENT_IP=$(echo "$line" | awk '{print $NF}')
+    fi
+    if echo "$line" | grep -q "445/tcp open"; then
+      log_both ""
+      log_both "SMB OPEN: $CURRENT_IP"
+      SMB_IPS+=("$CURRENT_IP")
+      FOUND=1
+    fi
+    if echo "$line" | grep -q "MAC Address" && [ "$FOUND" -eq 1 ]; then
+      MAC=$(echo "$line" | cut -d '(' -f1 | awk '{print $3}')
+      VENDOR=$(echo "$line" | sed 's/.*(//;s/)//')
+      log_both "  MAC: $MAC"
+      log_both "  Vendor: $VENDOR"
+      FOUND=0
+    fi
+  done < "$RAWFILE"
+
+  # Write next-step suggestions
+  log_both ""
+  log_both "================================"
+  log_both "NEXT STEP SUGGESTIONS"
+  log_both "================================"
+  if [ "${#SMB_IPS[@]}" -eq 0 ]; then
+    log_both "No SMB hosts found."
+  else
+    for ip in "${SMB_IPS[@]}"; do
+      log_both ""
+      log_both "Target: $ip"
+      log_both "  smbclient -L //$ip -U user"
+      log_both "  smbmap -H $ip -u user -p pass"
+      log_both "  crackmapexec smb $ip"
+    done
+  fi
+
+  log_both ""
+  log_both "Scan complete in ${ELAPSED}s"
+  log_both "Loot: $OUTFILE"
+
+  LED FINISH
+  show_scan_summary
+}
+
+show_scan_summary() {
+  COUNT="${#SMB_IPS[@]}"
+  ALERT "Done in ${ELAPSED}s\n$COUNT SMB host(s)\nfound." 3 false
+  ALERT "Done in ${ELAPSED}s\n$COUNT SMB host(s)\nfound.\n← Continue" -1 false
+
+  if [ "$COUNT" -gt 0 ]; then
+    RESP="$(OPTION_DIALOG "View Results?" " Yes " " No ")"
+    if [ "$RESP" = " Yes " ]; then
+      build_results_menu
+    fi
+  fi
+}
+
+build_results_menu() {
+  CLEAR_MENU "smb_results"
+  CREATE_SPINNER "Loading..."
+
+  for ip in "${SMB_IPS[@]}"; do
+    ADD_SUBMENU_ITEM "smb_results" "$ip" "smb_host_menu_${ip}"
+    ADD_SUBMENU_ITEM "smb_host_menu_${ip}" "smbclient" "noop"
+    ADD_SUBMENU_ITEM "smb_host_menu_${ip}" "smbmap" "noop"
+    ADD_SUBMENU_ITEM "smb_host_menu_${ip}" "crackmapexec" "noop"
+    ADD_SUBMENU_ITEM "smb_host_menu_${ip}" "Back" "Back"
+  done
+
+  ADD_SUBMENU_ITEM "smb_results" "Back" "Back"
+  STOP_SPINNER
+  SELECT_MENU smb_results
+}
+
+view_loot_files() {
+  FILES=$(ls "$LOOT_BASE"/*.txt 2>/dev/null | xargs -n1 basename | tr '\n' ' ')
+  if [ -z "$FILES" ]; then
+    ALERT "No loot files\nfound yet." 2 false
+    return
+  fi
+  RESP="$(LIST_PICKER "Loot Files" "$FILES" "$(echo $FILES | awk '{print $1}')")"
+  case "$RESP" in
+    "← Back") ;;
+    *)
+      PREVIEW=$(head -20 "$LOOT_BASE/$RESP" | tr '\n' '|' | sed 's/|/\\n/g')
+      ALERT "$PREVIEW" -1 false true
+    ;;
+  esac
+}
+
+setup_payload
+initialize_menu
+ALERT "SMB Spy v2.0\nShark Jack Display\n← to Start" -1 false true
+START_MENU
