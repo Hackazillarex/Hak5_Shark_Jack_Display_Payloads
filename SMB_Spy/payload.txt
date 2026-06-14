@@ -1,7 +1,7 @@
 #!/bin/bash
 # Title: SMB Spy Ported for the Shark Jack Display
-# Author: Hackazillarex
 # Description: Discovers SMB hosts using nmap and logs results with next-step suggestions
+# Author: Hackazillarex
 # Version: 2.1 (Shark Jack Display + Cloud C2)
 
 setup_payload() {
